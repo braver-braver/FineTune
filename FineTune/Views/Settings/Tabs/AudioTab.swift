@@ -72,6 +72,16 @@ struct AudioTab: View {
                     .controlSize(.small)
                     .labelsHidden()
             }
+            SettingsRowDivider()
+            SettingsRow(
+                "Headphone Volume Boost",
+                description: "Auto-boost headphones based on speaker volume"
+            ) {
+                Toggle("", isOn: $settings.appSettings.headphoneVolumeBoostEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .labelsHidden()
+            }
         }
     }
 

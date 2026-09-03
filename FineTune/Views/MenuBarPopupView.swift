@@ -576,51 +576,75 @@ struct MenuBarPopupView: View {
                             ?? audioEngine.autoEQProfileManager.catalogEntry(for: sel.profileID)?.name
                     }()
 
-                    DeviceRow(
-                        device: device,
-                        isDefault: device.id == deviceVolumeMonitor.defaultDeviceID,
-                        volume: deviceVolumeMonitor.volumes[device.id] ?? 1.0,
-                        isMuted: deviceVolumeMonitor.muteStates[device.id] ?? false,
-                        volumeBackend: audioEngine.outputVolumeBackend(for: device.id),
-                        onSetDefault: {
-                            audioEngine.setDefaultOutputDevice(device.id)
-                        },
-                        onVolumeChange: { volume in
-                            deviceVolumeMonitor.setVolume(for: device.id, to: volume)
-                        },
-                        onMuteToggle: {
-                            let currentMute = deviceVolumeMonitor.muteStates[device.id] ?? false
-                            deviceVolumeMonitor.setMute(for: device.id, to: !currentMute)
-                        },
-                        autoEQProfileName: profileName,
-                        autoEQEnabled: selection?.isEnabled ?? false,
-                        onAutoEQToggle: { enabled in
-                            audioEngine.setAutoEQEnabled(for: device.uid, enabled: enabled)
-                        },
-                        autoEQProfileManager: audioEngine.autoEQProfileManager,
-                        autoEQSelection: selection,
-                        autoEQFavoriteIDs: audioEngine.settingsManager.favoriteAutoEQProfileIDs,
-                        onAutoEQSelect: { profile in
-                            audioEngine.setAutoEQProfile(for: device.uid, profileID: profile?.id)
-                        },
-                        onAutoEQImport: {
-                            importAutoEQFile(for: device.uid)
-                        },
-                        onAutoEQToggleFavorite: { id in
-                            if audioEngine.settingsManager.isAutoEQFavorite(id: id) {
-                                audioEngine.settingsManager.unfavoriteAutoEQProfile(id: id)
-                            } else {
-                                audioEngine.settingsManager.favoriteAutoEQProfile(id: id)
-                            }
-                        },
-                        autoEQImportError: autoEQImportError,
-                        autoEQPreampEnabled: audioEngine.autoEQPreampEnabled,
-                        onAutoEQPreampToggle: {
-                            audioEngine.setAutoEQPreampEnabled(!audioEngine.autoEQPreampEnabled)
-                        },
-                        isFocused: hasKeyboardEngaged && selectedRow == .device(uid: device.uid),
-                        iconOverrideSymbol: audioEngine.settingsManager.getDeviceIconOverride(for: device.uid)
-                    )
+                    ExpandableGlassRow(
+                        isExpanded: expandedDeviceUID == device.uid,
+                        isFocused: hasKeyboardEngaged && selectedRow == .device(uid: device.uid)
+                    ) {
+                        DeviceRow(
+                            device: device,
+                            isDefault: device.id == deviceVolumeMonitor.defaultDeviceID,
+                            volume: deviceVolumeMonitor.volumes[device.id] ?? 1.0,
+                            isMuted: deviceVolumeMonitor.muteStates[device.id] ?? false,
+                            volumeBackend: audioEngine.outputVolumeBackend(for: device.id),
+                            onSetDefault: {
+                                audioEngine.setDefaultOutputDevice(device.id)
+                            },
+                            onVolumeChange: { volume in
+                                deviceVolumeMonitor.setVolume(for: device.id, to: volume)
+                            },
+                            onMuteToggle: {
+                                let currentMute = deviceVolumeMonitor.muteStates[device.id] ?? false
+                                deviceVolumeMonitor.setMute(for: device.id, to: !currentMute)
+                            },
+                            autoEQProfileName: profileName,
+                            autoEQEnabled: selection?.isEnabled ?? false,
+                            onAutoEQToggle: { enabled in
+                                audioEngine.setAutoEQEnabled(for: device.uid, enabled: enabled)
+                            },
+                            autoEQProfileManager: audioEngine.autoEQProfileManager,
+                            autoEQSelection: selection,
+                            autoEQFavoriteIDs: audioEngine.settingsManager.favoriteAutoEQProfileIDs,
+                            onAutoEQSelect: { profile in
+                                audioEngine.setAutoEQProfile(for: device.uid, profileID: profile?.id)
+                            },
+                            onAutoEQImport: {
+                                importAutoEQFile(for: device.uid)
+                            },
+                            onAutoEQToggleFavorite: { id in
+                                if audioEngine.settingsManager.isAutoEQFavorite(id: id) {
+                                    audioEngine.settingsManager.unfavoriteAutoEQProfile(id: id)
+                                } else {
+                                    audioEngine.settingsManager.favoriteAutoEQProfile(id: id)
+                                }
+                            },
+                            autoEQImportError: autoEQImportError,
+                            autoEQPreampEnabled: audioEngine.autoEQPreampEnabled,
+                            onAutoEQPreampToggle: {
+                                audioEngine.setAutoEQPreampEnabled(!audioEngine.autoEQPreampEnabled)
+                            },
+                            isFocused: hasKeyboardEngaged && selectedRow == .device(uid: device.uid),
+                            iconOverrideSymbol: audioEngine.settingsManager.getDeviceIconOverride(for: device.uid)
+                        )
+                    } expandedContent: {
+                        DeviceDetailSheet(
+                            device: device,
+                            transportType: device.id.readTransportType(),
+                            autoDetectedTier: deviceVolumeMonitor.autoDetectedOutputVolumeBackend(for: device.id),
+                            currentOverride: audioEngine.settingsManager.getDeviceVolumeTierOverride(for: device.uid),
+                            settingsManager: audioEngine.settingsManager,
+                            onOverrideChange: { newTier in
+                                audioEngine.settingsManager.setDeviceVolumeTierOverride(for: device.uid, to: newTier)
+                                deviceVolumeMonitor.applyTierOverrideChange(for: device.id)
+                            },
+                            onDismiss: {}
+                        )
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                            expandedDeviceUID = (expandedDeviceUID == device.uid) ? nil : device.uid
+                        }
+                    }
                     .id(PopupKeyboardNavModel.RowID.device(uid: device.uid))
                 }
 
@@ -687,6 +711,7 @@ struct MenuBarPopupView: View {
                         transportType: device.id.readTransportType(),
                         autoDetectedTier: deviceVolumeMonitor.autoDetectedOutputVolumeBackend(for: device.id),
                         currentOverride: audioEngine.settingsManager.getDeviceVolumeTierOverride(for: device.uid),
+                        settingsManager: audioEngine.settingsManager,
                         onOverrideChange: { newTier in
                             audioEngine.settingsManager.setDeviceVolumeTierOverride(for: device.uid, to: newTier)
                             deviceVolumeMonitor.applyTierOverrideChange(for: device.id)

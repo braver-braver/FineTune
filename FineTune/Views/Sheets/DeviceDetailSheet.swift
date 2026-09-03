@@ -11,7 +11,10 @@ struct DeviceDetailSheet: View {
     let onOverrideChange: (VolumeControlTier?) -> Void
     let onDismiss: () -> Void
 
+    @Bindable var settingsManager: SettingsManager
+
     @State private var viewModel: DeviceInspectorViewModel
+    @State private var volumeBoostMultiplier: Float
 
     private static let logger = Logger(subsystem: "com.finetuneapp.FineTune", category: "DeviceDetailSheet")
 
@@ -20,6 +23,7 @@ struct DeviceDetailSheet: View {
         transportType: TransportType,
         autoDetectedTier: VolumeControlTier,
         currentOverride: VolumeControlTier?,
+        settingsManager: SettingsManager,
         onOverrideChange: @escaping (VolumeControlTier?) -> Void,
         onDismiss: @escaping () -> Void
     ) {
@@ -27,6 +31,7 @@ struct DeviceDetailSheet: View {
         self.transportType = transportType
         self.autoDetectedTier = autoDetectedTier
         self.currentOverride = currentOverride
+        self.settingsManager = settingsManager
         self.onOverrideChange = onOverrideChange
         self.onDismiss = onDismiss
         self._viewModel = State(
@@ -35,6 +40,9 @@ struct DeviceDetailSheet: View {
                 uid: device.uid,
                 transportType: transportType
             )
+        )
+        self._volumeBoostMultiplier = State(
+            initialValue: settingsManager.getDeviceVolumeBoost(for: device.uid) ?? 1.5
         )
     }
 
@@ -59,6 +67,12 @@ struct DeviceDetailSheet: View {
                 hogModeRow(hogLine)
             }
 
+            // Volume Boost control for headphone/earphone devices
+            if settingsManager.appSettings.headphoneVolumeBoostEnabled && isHeadphoneDevice {
+                separator
+                volumeBoostControl
+            }
+
             if Self.shouldShowToggle(autoTier: autoDetectedTier) {
                 separator
                 softwareToggle
@@ -76,6 +90,71 @@ struct DeviceDetailSheet: View {
         .padding(.bottom, DesignTokens.Spacing.xs)
         .onAppear { viewModel.start() }
         .onDisappear { viewModel.stop() }
+    }
+
+    // MARK: - Headphone Detection
+
+    private var isHeadphoneDevice: Bool {
+        device.uid == "BuiltInHeadphoneOutputDevice" ||
+        device.name.localizedCaseInsensitiveContains("earpods") ||
+        device.name.localizedCaseInsensitiveContains("headphone") ||
+        device.name.localizedCaseInsensitiveContains("earphone") ||
+        device.name.localizedCaseInsensitiveContains("earbuds") ||
+        (device.uid.contains("EarPods") && device.uid.contains("AppleUSBAudioEngine"))
+    }
+
+    // MARK: - Volume Boost Control
+
+    private var volumeBoostControl: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: DesignTokens.Spacing.xs) {
+                Text("Volume Boost")
+                    .font(DesignTokens.Typography.pickerText)
+                    .foregroundStyle(DesignTokens.Colors.textPrimary)
+
+                Spacer(minLength: DesignTokens.Spacing.sm)
+
+                Text("\(volumeBoostMultiplier, specifier: "%.2f")×")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(DesignTokens.Colors.textSecondary)
+                    .monospacedDigit()
+                    .frame(width: 45, alignment: .trailing)
+            }
+
+            Slider(
+                value: $volumeBoostMultiplier,
+                in: 1.0...2.0
+            )
+            .onChange(of: volumeBoostMultiplier) { _, newValue in
+                settingsManager.setDeviceVolumeBoost(for: device.uid, to: newValue)
+                // Apply boost immediately if device is currently active
+                applyVolumeBoostImmediately()
+            }
+
+            Text("Multiplier relative to speaker volume (1.0× = same as speaker)")
+                .font(DesignTokens.Typography.caption)
+                .foregroundStyle(DesignTokens.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - Apply Volume Boost
+
+    private func applyVolumeBoostImmediately() {
+        // Get speaker volume as baseline
+        let speakerUID = "BuiltInSpeakerDevice"
+        let speakerVolume: Float = 0.5 // Default fallback
+
+        // Calculate target volume
+        let targetVolume = min(1.0, speakerVolume * volumeBoostMultiplier)
+
+        // Set device volume if it's currently active
+        if device.id.isDeviceAlive() {
+            let currentVolume = device.id.readOutputVolumeScalar()
+            if currentVolume != targetVolume {
+                _ = device.id.setOutputVolumeScalar(targetVolume)
+            }
+        }
     }
 
     // MARK: - Auto badge

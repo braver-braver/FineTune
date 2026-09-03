@@ -102,8 +102,24 @@ extension AudioDeviceID {
             return false
         }
 
-        // 0x6864706E = 'hdpn' — CoreAudio-internal FourCC for headphones, language-independent
-        return sourceID == 0x6864706E
+        // Known headphone data source IDs:
+        // 0x6864706E = 'hdpn' — EarPods and most headphones
+        // 0x686A636B = 'hjck' — headphone jack (some Macs)
+        // 0x68656164 = 'head' — headphones (alternative)
+        // Exclude speaker: 0x73706B72 = 'spkr'
+
+        switch sourceID {
+        case 0x6864706E,  // 'hdpn'
+             0x686A636B,  // 'hjck'
+             0x68656164:  // 'head'
+            return true
+        case 0x73706B72:  // 'spkr'
+            return false
+        default:
+            // For unknown IDs, assume it's headphones if it's not speakers
+            // Log for debugging
+            return true
+        }
     }
 }
 // MARK: - Device Icon

@@ -22,6 +22,9 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
     /// Called when an output device appears (passes UID and name)
     var onDeviceConnected: ((_ uid: String, _ name: String) -> Void)?
 
+    /// Called when built-in device data source changes (headphone jack plug/unplug)
+    var onBuiltInDataSourceChanged: ((_ deviceID: AudioDeviceID, _ uid: String, _ name: String) -> Void)?
+
     // MARK: - Input Devices
 
     private(set) var inputDevices: [AudioDevice] = []
@@ -58,6 +61,12 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
 
     /// Listeners for kAudioDevicePropertyDataSource changes on built-in devices (headphone jack detection)
     @ObservationIgnored private var dataSourceListeners: [AudioDeviceID: AudioObjectPropertyListenerBlock] = [:]
+
+    /// Tracks last known data source for each built-in device to detect actual changes
+    @ObservationIgnored private var lastKnownDataSources: [AudioDeviceID: UInt32] = [:]
+
+    /// Debounces rapid DataSource changes (e.g., headphone jack glitches during insertion)
+    @ObservationIgnored private var dataSourceDebounce: [AudioDeviceID: Task<Void, Never>] = [:]
 
     /// Called when a BT output device crosses the A2DP ↔ SCO/HFP sample-rate boundary (44.1 kHz).
     /// Off-protocol (on the concrete monitor) — wired via the `as? AudioDeviceMonitor` cast, like the
@@ -239,6 +248,15 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
 
         // Add listeners for new built-in devices
         for deviceID in builtInIDs.subtracting(currentIDs) {
+            // Store initial data source state
+            if let sourceID: UInt32 = try? deviceID.read(
+                kAudioDevicePropertyDataSource,
+                scope: .output,
+                defaultValue: 0
+            ) {
+                lastKnownDataSources[deviceID] = sourceID
+            }
+
             var address = AudioObjectPropertyAddress(
                 mSelector: kAudioDevicePropertyDataSource,
                 mScope: kAudioObjectPropertyScopeOutput,
@@ -246,7 +264,7 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
             )
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                 Task { @MainActor [weak self] in
-                    self?.scheduleDeviceListRefresh()
+                    self?.scheduleDataSourceCheck(deviceID: deviceID)
                 }
             }
             let status = AudioObjectAddPropertyListenerBlock(deviceID, &address, .main, block)
@@ -258,8 +276,66 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
         }
     }
 
+    /// 200ms debounce — the HAL sometimes fires multiple DataSource notifications during
+    /// headphone jack insertion, especially with loose connections or adapters.
+    private func scheduleDataSourceCheck(deviceID: AudioDeviceID) {
+        dataSourceDebounce[deviceID]?.cancel()
+        dataSourceDebounce[deviceID] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled, let self else { return }
+            self.handleDataSourceChanged(deviceID: deviceID)
+        }
+    }
+
+    /// Handles data source changes for built-in devices (e.g., headphone jack plug/unplug)
+    private func handleDataSourceChanged(deviceID: AudioDeviceID) {
+        guard let newSourceID: UInt32 = try? deviceID.read(
+            kAudioDevicePropertyDataSource,
+            scope: .output,
+            defaultValue: 0
+        ) else {
+            logger.warning("Failed to read data source for device \(deviceID)")
+            scheduleDeviceListRefresh()
+            return
+        }
+
+        let oldSourceID = lastKnownDataSources[deviceID] ?? 0
+        guard newSourceID != oldSourceID else {
+            // No actual change, just refresh
+            scheduleDeviceListRefresh()
+            return
+        }
+
+        lastKnownDataSources[deviceID] = newSourceID
+
+        // Log the change with all details
+        let isHeadphones = newSourceID == 0x6864706E  // 'hdpn'
+        let oldFourCC = String(format: "%c%c%c%c",
+                              (oldSourceID >> 24) & 0xFF,
+                              (oldSourceID >> 16) & 0xFF,
+                              (oldSourceID >> 8) & 0xFF,
+                              oldSourceID & 0xFF)
+        let newFourCC = String(format: "%c%c%c%c",
+                              (newSourceID >> 24) & 0xFF,
+                              (newSourceID >> 16) & 0xFF,
+                              (newSourceID >> 8) & 0xFF,
+                              newSourceID & 0xFF)
+        logger.info("Built-in data source changed: 0x\(String(format: "%08X", oldSourceID)) '\(oldFourCC)' → 0x\(String(format: "%08X", newSourceID)) '\(newFourCC)' (headphones: \(isHeadphones))")
+
+        // Refresh device list first to update device properties
+        scheduleDeviceListRefresh()
+
+        // Notify engine about the data source change
+        if let device = devicesByID[deviceID] {
+            onBuiltInDataSourceChanged?(deviceID, device.uid, device.name)
+        }
+    }
+
     private func removeDataSourceListener(for deviceID: AudioDeviceID) {
         guard let block = dataSourceListeners.removeValue(forKey: deviceID) else { return }
+        lastKnownDataSources.removeValue(forKey: deviceID)
+        dataSourceDebounce[deviceID]?.cancel()
+        dataSourceDebounce.removeValue(forKey: deviceID)
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDataSource,
             mScope: kAudioObjectPropertyScopeOutput,

@@ -173,16 +173,23 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     private func autoDetectBackend(for deviceID: AudioDeviceID) -> VolumeControlTier {
-        if deviceID.hasOutputVolumeControl() {
+        let hasVolumeControl = deviceID.hasOutputVolumeControl()
+        let deviceName = (try? deviceID.readDeviceName()) ?? "Unknown"
+        let deviceUID = (try? deviceID.readDeviceUID()) ?? "unknown"
+
+        if hasVolumeControl {
+            logger.info("Device '\(deviceName)' (\(deviceUID)) has hardware volume control")
             return .hardware
         }
 
         #if !APP_STORE
         if let ddcController, ddcController.isDDCBacked(deviceID) {
+            logger.info("Device '\(deviceName)' (\(deviceUID)) uses DDC volume control")
             return .ddc
         }
         #endif
 
+        logger.info("Device '\(deviceName)' (\(deviceUID)) uses software volume control")
         return .software
     }
 
@@ -967,6 +974,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
             let visibleVolume = settingsManager.getSoftwareDeviceVolume(for: device.uid) ?? defaultVolume
             volumes[deviceID] = Self.storedVolume(visibleVolume, tier: backend)
             muteStates[deviceID] = muted
+            logger.debug("Device '\(device.name)' (\(device.uid)) software volume: \(visibleVolume, format: .fixed(precision: 2)), muted: \(muted)")
             return
         }
 
@@ -985,6 +993,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
 
         let volume = clampedVolume(deviceID.readOutputVolumeScalar())
         volumes[deviceID] = volume
+        logger.info("Device '\(device.name)' (\(device.uid)) hardware volume: \(volume, format: .fixed(precision: 2))")
 
         let muted = deviceID.readMuteState()
         muteStates[deviceID] = muted

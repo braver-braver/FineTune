@@ -40,6 +40,10 @@ nonisolated struct AppSettings: Codable, Equatable {
     var loudnessCompensationEnabled: Bool = false  // ISO 226:2023 equal-loudness contour compensation
     var loudnessEqualizationEnabled: Bool = false  // Real-time loudness equalization
 
+    // Headphone Volume Boost
+    var headphoneVolumeBoostEnabled: Bool = true   // Automatically boost headphone volume on connection
+    var headphoneVolumeBoostLevel: Float = 0.85    // Target volume level (0.0-1.0), default 85%
+
     // Media Keys & HUD
     var hudStyle: HUDStyle = .tahoe                // Visual style of the volume HUD
     var mediaKeyControlEnabled: Bool = true        // Intercept F10/F11/F12 to drive the default output device
@@ -72,6 +76,8 @@ nonisolated struct AppSettings: Codable, Equatable {
         showDeviceDisconnectAlerts = try c.decodeIfPresent(Bool.self, forKey: .showDeviceDisconnectAlerts) ?? true
         loudnessCompensationEnabled = try c.decodeIfPresent(Bool.self, forKey: .loudnessCompensationEnabled) ?? false
         loudnessEqualizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .loudnessEqualizationEnabled) ?? false
+        headphoneVolumeBoostEnabled = try c.decodeIfPresent(Bool.self, forKey: .headphoneVolumeBoostEnabled) ?? true
+        headphoneVolumeBoostLevel = try c.decodeIfPresent(Float.self, forKey: .headphoneVolumeBoostLevel) ?? 0.85
         hudStyle = try c.decodeIfPresent(HUDStyle.self, forKey: .hudStyle) ?? .tahoe
         mediaKeyControlEnabled = try c.decodeIfPresent(Bool.self, forKey: .mediaKeyControlEnabled) ?? true
         volumeHotkeyStep = try c.decodeIfPresent(VolumeHotkeyStep.self, forKey: .volumeHotkeyStep) ?? .normal
@@ -98,6 +104,7 @@ final class SettingsManager {
         var appMutes: [String: Bool] = [:]  // bundleID → isMuted
         var appBoosts: [String: Float] = [:]  // bundleID → boost rawValue (1.0, 2.0, 3.0, 4.0)
         var appEQSettings: [String: EQSettings] = [:]  // bundleID → EQ settings
+        var deviceVolumeBoosts: [String: Float] = [:]  // deviceUID → volume multiplier (1.0 - 2.0)
         var appSettings: AppSettings = AppSettings()  // App-wide settings
         var systemSoundsFollowsDefault: Bool = true  // Whether system sounds follows macOS default
         var appDeviceSelectionMode: [String: DeviceSelectionMode] = [:]  // bundleID → selection mode
@@ -936,5 +943,25 @@ final class SettingsManager {
     private func normalizedDeviceVolume(_ volume: Float) -> Float {
         guard volume.isFinite else { return 1.0 }
         return max(0.0, min(1.0, volume))
+    }
+
+    // MARK: - Device Volume Boost
+
+    /// Gets the volume boost multiplier for a device (1.0 - 2.0).
+    /// Returns nil if no custom boost is set (will use default).
+    func getDeviceVolumeBoost(for deviceUID: String) -> Float? {
+        settings.deviceVolumeBoosts[deviceUID]
+    }
+
+    /// Sets the volume boost multiplier for a device (1.0 - 2.0).
+    /// Pass nil to remove the custom boost and use default.
+    func setDeviceVolumeBoost(for deviceUID: String, to multiplier: Float?) {
+        if let multiplier {
+            let clamped = max(1.0, min(2.0, multiplier))
+            settings.deviceVolumeBoosts[deviceUID] = clamped
+        } else {
+            settings.deviceVolumeBoosts.removeValue(forKey: deviceUID)
+        }
+        scheduleSave()
     }
 }

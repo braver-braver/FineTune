@@ -1,4 +1,5 @@
 // FineTune/Audio/Engine/AudioEngine.swift
+import AppKit
 import AudioToolbox
 import Foundation
 import os
@@ -371,12 +372,20 @@ final class AudioEngine {
 
         deviceMonitor.onDeviceDisconnected = { [weak self] deviceUID, deviceName in
             self?.handleDeviceDisconnected(deviceUID, name: deviceName)
+            self?.pauseAudioOnDeviceDisconnect(uid: deviceUID, name: deviceName)
             self?.bluetoothDeviceMonitor.refresh()
         }
 
         deviceMonitor.onDeviceConnected = { [weak self] deviceUID, deviceName in
             self?.handleDeviceConnected(deviceUID, name: deviceName)
             self?.bluetoothDeviceMonitor.notifyDeviceAppearedInCoreAudio()
+        }
+
+        // Handle built-in device data source changes (headphone jack plug/unplug)
+        if let monitor = deviceMonitor as? AudioDeviceMonitor {
+            monitor.onBuiltInDataSourceChanged = { [weak self] deviceID, deviceUID, deviceName in
+                self?.handleBuiltInDataSourceChanged(deviceID: deviceID, uid: deviceUID, name: deviceName)
+            }
         }
 
         deviceMonitor.onInputDeviceDisconnected = { [weak self] deviceUID, deviceName in
@@ -1530,6 +1539,17 @@ final class AudioEngine {
             isAlive: isAliveCheck
         )?.uid)
 
+        // Check if this is a built-in headphone device (special case)
+        let isBuiltInHeadphone = deviceUID == "BuiltInHeadphoneOutputDevice" ||
+                                 deviceName.localizedCaseInsensitiveContains("headphone")
+
+        // Check if this is EarPods or other earphone/headphone device
+        let isEarphoneDevice = deviceName.localizedCaseInsensitiveContains("earpods") ||
+                               deviceName.localizedCaseInsensitiveContains("headphone") ||
+                               deviceName.localizedCaseInsensitiveContains("earphone") ||
+                               deviceName.localizedCaseInsensitiveContains("earbuds") ||
+                               (deviceUID.contains("EarPods") && deviceUID.contains("AppleUSBAudioEngine"))
+
         // If this device is present but not alive, watch for it to become alive
         if let device = deviceMonitor.device(for: deviceUID),
            !isAliveCheck(device.id) {
@@ -1538,11 +1558,36 @@ final class AudioEngine {
 
         if isNewDeviceHigherPriority, deviceUID != currentDefault {
             // A higher-priority device reconnected — switch to it
+            logger.info("Higher priority device connected, switching to it")
             reEvaluateOutputDefault()
+
+            // Boost volume for earphone/headphone devices
+            if isEarphoneDevice, let device = deviceMonitor.device(for: deviceUID) {
+                boostHeadphoneVolumeIfNeeded(deviceID: device.id, uid: deviceUID, name: deviceName)
+            }
         } else if !isNewDeviceHigherPriority, currentDefault == deviceUID {
-            // macOS already auto-switched to the lower-priority device — restore
-            // what the user was on (not highest priority — they may have chosen a mid-priority device)
-            restoreConfirmedDefault()
+            // macOS already auto-switched to the lower-priority device
+            // For built-in headphones and earphone devices, respect macOS's choice (user plugged them in)
+            // For other devices, restore what the user was on
+            if isBuiltInHeadphone || isEarphoneDevice {
+                logger.info("Earphone/headphone device connected and macOS switched to them, keeping device")
+                // Don't restore - user explicitly plugged in headphones
+                // Boost volume if needed
+                if let device = deviceMonitor.device(for: deviceUID) {
+                    boostHeadphoneVolumeIfNeeded(deviceID: device.id, uid: deviceUID, name: deviceName)
+                }
+            } else {
+                logger.info("Lower priority device connected and macOS switched to it, restoring previous")
+                restoreConfirmedDefault()
+            }
+        } else if deviceUID == currentDefault {
+            // Already on this device
+            logger.info("Device connected and is already the default")
+
+            // Boost volume for earphone/headphone devices even if already default
+            if isEarphoneDevice, let device = deviceMonitor.device(for: deviceUID) {
+                boostHeadphoneVolumeIfNeeded(deviceID: device.id, uid: deviceUID, name: deviceName)
+            }
         }
 
         // Cancel any existing PENDING_AUTOSWITCH before entering a new one.
@@ -2123,6 +2168,191 @@ final class AudioEngine {
         // Apply the change
         if deviceVolumeMonitor.setDefaultInputDevice(device.id) {
             inputEchoTracker.increment(device.uid)
+        }
+    }
+
+    /// Called when built-in device data source changes (e.g., headphone jack plug/unplug).
+    /// Treats headphone connection as a high-priority device change to trigger auto-switch.
+    private func handleBuiltInDataSourceChanged(deviceID: AudioDeviceID, uid deviceUID: String, name deviceName: String) {
+        // Check if headphones are now active
+        let hasHeadphones = deviceID.builtInHasHeadphonesActive()
+        logger.info("Built-in data source changed: \(deviceName) (headphones: \(hasHeadphones))")
+
+        // Only act on headphone insertion, not removal
+        guard hasHeadphones else {
+            logger.debug("Headphones removed, no action needed")
+            return
+        }
+
+        // Boost volume if it's too low (macOS often defaults headphones to 50%)
+        boostHeadphoneVolumeIfNeeded(deviceID: deviceID, uid: deviceUID, name: deviceName)
+
+        // Check if built-in output is now the highest priority device
+        let isBuiltInHighestPriority = (deviceUID == Self.resolveHighestPriority(
+            priorityOrder: settingsManager.devicePriorityOrder,
+            connectedDevices: outputDevices,
+            isAlive: isAliveCheck
+        )?.uid)
+
+        let currentDefault = deviceVolumeMonitor.defaultDeviceUID
+        logger.info("Headphones detected - Built-in highest priority: \(isBuiltInHighestPriority), current default: \(currentDefault ?? "none"), built-in UID: \(deviceUID)")
+
+        // If built-in is highest priority and not already default, switch to it
+        if isBuiltInHighestPriority, deviceUID != currentDefault {
+            logger.info("Headphones plugged in, switching to built-in output")
+            reEvaluateOutputDefault()
+        } else if !isBuiltInHighestPriority {
+            logger.info("Headphones plugged in but built-in is not highest priority, keeping current device")
+            // Don't restore - user may want to stay on current device
+        } else if deviceUID == currentDefault {
+            logger.info("Headphones plugged in, already on built-in output")
+        }
+
+        // Enter pending auto-switch state to guard against macOS interference
+        if case .pendingAutoSwitch(_, let oldTask) = outputPriorityState {
+            oldTask.cancel()
+        }
+
+        let timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(self?.autoSwitchGracePeriod ?? 2.0))
+            guard let self, !Task.isCancelled else { return }
+            self.outputPriorityState = .stable
+            self.logger.debug("Built-in auto-switch grace period expired")
+        }
+
+        lastAutoSwitchOverrideTime = nil
+        outputPriorityState = .pendingAutoSwitch(
+            connectedDeviceUID: deviceUID,
+            timeoutTask: timeoutTask
+        )
+        logger.debug("Entered PENDING_AUTOSWITCH for built-in (\(self.autoSwitchGracePeriod)s grace)")
+    }
+
+    /// Pauses audio playback when headphone/earphone devices disconnect
+    private func pauseAudioOnDeviceDisconnect(uid: String, name: String) {
+        logger.info("🎧 Device disconnected: \(name) (\(uid))")
+
+        // Check if this is a headphone/earphone device
+        let lowerName = name.lowercased()
+        let isEarphoneDevice = lowerName.contains("earpods") ||
+                               lowerName.contains("headphone") ||
+                               lowerName.contains("earphone") ||
+                               lowerName.contains("earbuds") ||
+                               (uid.contains("EarPods") && uid.contains("AppleUSBAudioEngine"))
+
+        guard isEarphoneDevice else {
+            logger.debug("Device is not a headphone/earphone, skipping auto-pause")
+            return
+        }
+
+        logger.info("⏸️ Earphone device disconnected, sending pause command")
+
+        // Send both key down and key up events for play/pause
+        // NX_KEYTYPE_PLAY = 16
+        let keyCode: Int32 = 16
+
+        // Key down event
+        let keyDownFlags: Int32 = 0x0A00
+        let data1Down = Int((keyCode << 16) | keyDownFlags)
+
+        if let eventDown = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: data1Down,
+            data2: -1
+        ) {
+            eventDown.cgEvent?.post(tap: .cghidEventTap)
+            logger.debug("Play/pause key down sent")
+        }
+
+        // Key up event
+        let keyUpFlags: Int32 = 0x0B00
+        let data1Up = Int((keyCode << 16) | keyUpFlags)
+
+        if let eventUp = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: data1Up,
+            data2: -1
+        ) {
+            eventUp.cgEvent?.post(tap: .cghidEventTap)
+            logger.debug("Play/pause key up sent")
+        }
+
+        logger.info("✅ Play/pause event cycle completed")
+    }
+
+    /// Boosts headphone volume based on speaker volume and device-specific multiplier.
+    /// Each device can have its own boost multiplier (1.0x - 2.0x) relative to speaker volume.
+    private func boostHeadphoneVolumeIfNeeded(deviceID: AudioDeviceID, uid: String, name: String) {
+        logger.info("🔍 boostHeadphoneVolumeIfNeeded called for: \(name) (\(uid))")
+
+        // Check if boost is enabled
+        guard settingsManager.appSettings.headphoneVolumeBoostEnabled else {
+            logger.info("❌ Headphone volume boost is disabled in settings")
+            return
+        }
+
+        logger.info("✓ Headphone volume boost is enabled")
+
+        // Wait for device list and volume monitoring to stabilize
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self else { return }
+
+            guard deviceID.isValid, deviceID.isDeviceAlive() else {
+                self.logger.warning("Device \(name) is not ready for volume boost")
+                return
+            }
+
+            let currentVolume = deviceID.readOutputVolumeScalar()
+
+            // Get speaker volume as baseline
+            let speakerUID = "BuiltInSpeakerDevice"
+            let speakerVolume: Float
+            if let speakerDevice = self.deviceMonitor.device(for: speakerUID) {
+                speakerVolume = speakerDevice.id.readOutputVolumeScalar()
+                self.logger.info("🔊 Speaker volume: \(speakerVolume, format: .fixed(precision: 2)) (\(Int(speakerVolume * 100))%)")
+            } else {
+                speakerVolume = 0.5  // Default to 50% if speaker not found
+                self.logger.debug("Speaker not found, using default 50%")
+            }
+
+            // Get device-specific boost multiplier (default 1.5x)
+            let boostMultiplier = self.settingsManager.getDeviceVolumeBoost(for: uid) ?? 1.5
+
+            // Calculate target volume: speaker volume × multiplier
+            let targetVolume = min(1.0, speakerVolume * boostMultiplier)
+
+            self.logger.info("📊 Current volume: \(Int(currentVolume * 100))%, Speaker: \(Int(speakerVolume * 100))%, Multiplier: \(boostMultiplier, format: .fixed(precision: 1))x, Target: \(Int(targetVolume * 100))%")
+
+            // Only boost if target is higher than current
+            if targetVolume > currentVolume {
+                self.logger.info("🎧 Boosting headphone volume from \(Int(currentVolume * 100))% to \(Int(targetVolume * 100))%")
+
+                if deviceID.setOutputVolumeScalar(targetVolume) {
+                    // Update internal state
+                    self.deviceVolumeMonitor.setVolume(for: deviceID, to: targetVolume)
+
+                    // Verify the change
+                    let verifyVolume = deviceID.readOutputVolumeScalar()
+                    self.logger.info("✅ Headphone volume boost successful, verified: \(Int(verifyVolume * 100))%")
+                } else {
+                    self.logger.warning("❌ Failed to set headphone volume")
+                }
+            } else {
+                self.logger.info("✓ Headphone volume \(Int(currentVolume * 100))% is already at or above target \(Int(targetVolume * 100))%, no boost needed")
+            }
         }
     }
 
